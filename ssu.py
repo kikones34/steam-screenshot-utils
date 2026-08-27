@@ -22,11 +22,12 @@ Usage:
 
 Notes:
     - Your steam user folder is in Steam/userdata/<user_id>.
-    - Sorting doesn't have an output argument becasue it's done in-place.
+    - Sorting doesn't have an output argument because it's done in-place.
     - For merging, the compressed screenshots folder is expected to be the output of the backup command,
       and the uncompressed screenshots folder is expected to be the output of the sort command.
 
 """
+
 import glob
 import json
 import os
@@ -34,6 +35,7 @@ import platform
 import re
 import shutil
 import sys
+import time
 
 import requests
 from docopt import docopt
@@ -50,55 +52,68 @@ class AppidConverter:
     def __init__(self, cache_file: str):
         self.cache_file = cache_file
         self.appid_names = {}
-        self.downloaded_app_data = False
 
         self._load_appid_names()
 
-    def _download_app_data(self):
-        """
-        Downloads app data form the Steam API.
-        Saves a mapping of appid -> name in a local cache file.
-        """
-        r = requests.get("https://api.steampowered.com/ISteamApps/GetAppList/v0002")
-        if r.status_code != 200:
-            raise Exception("Error getting app data from Steam API.")
-        app_data = r.json()
-
-        appid_names = {str(app['appid']): app['name'] for app in app_data['applist']['apps']}
-        with open(self.cache_file, 'w') as f:
-            json.dump(appid_names, f)
-
-        self.downloaded_app_data = True
-        self.appid_names = appid_names
-
     def _load_appid_names(self):
         """
-        Attempts to load the appid -> name map from local cache.
-        If it doesn't exist, downloads app data from the Steam API.
+        Loads the appid -> name map from local cache, if it exists.
         """
         if os.path.exists(self.cache_file):
             print("Loading appid names from local cache...")
             with open(self.cache_file) as f:
                 self.appid_names = json.load(f)
-        else:
-            print("Downloading app data from Steam API...")
-            self._download_app_data()
+
+    def _save_appid_names(self):
+        """
+        Saves the appid -> name map to local cache.
+        """
+        with open(self.cache_file, "w") as f:
+            json.dump(self.appid_names, f)
+
+    def _fetch_app_name(self, appid: str):
+        """
+        Fetches an app name from the Steam API.
+        Returns None if the appid doesn't exist in the Steam database.
+
+        The API is rate-limited, if it returns 429, we wait 5 minutes and retry once.
+        """
+        url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
+        r = requests.get(url)
+        if r.status_code == 429:
+            print("Hit the Steam API rate limit, waiting 5 minutes before retrying...")
+            time.sleep(5 * 60 + 1)
+            r = requests.get(url)
+        r.raise_for_status()
+
+        app_data = r.json()[appid]
+        if not app_data["success"]:
+            return None
+        return app_data["data"]["name"]
 
     def get_app_name(self, appid: str):
         """
         Converts an appid to its corresponding app name.
-        If the appid is not found in local cache, assumes it's outdated and downloads app data from the Steam API.
-        If the appid still cannot be found, gives up and returns the appid.
+        If the appid is not found in local cache, fetches it from the Steam API and caches the result.
+        If the appid doesn't exist in the Steam database, gives up and returns the appid.
+        (This is also cached, so we don't ask the API again for an appid we know it can't resolve).
+        If the request fails for any other reason, also returns the appid, but doesn't cache it.
         """
         name = self.appid_names.get(appid)
         if not name:
-            if not self.downloaded_app_data:
-                print(f"Appid {appid} not found in local cache, downloading app data from Steam API...")
-                self._download_app_data()
-                return self.get_app_name(appid)
-            else:
-                print(f"Appid {appid} not found in the Steam database, skipping name conversion.")
+            print(f"Appid {appid} not found in local cache, fetching from Steam API...")
+            try:
+                name = self._fetch_app_name(appid)
+            except Exception as e:
+                print(
+                    f"Could not fetch app data, skipping name conversion: {e.__class__.__name__}: {e}."
+                )
                 return appid
+            if not name:
+                print(f"Appid {appid} not found in the Steam database, skipping name conversion.")
+                name = appid
+            self.appid_names[appid] = name
+            self._save_appid_names()
         return name
 
 
@@ -109,10 +124,10 @@ def sanitize_app_name(name):
     """
 
     if platform.system() == "Windows":
-        return re.sub(r'[<>:"/\\|?*]', '', name)
+        return re.sub(r'[<>:"/\\|?*]', "", name)
     else:
         # assume unix-like if platform is not windows
-        return re.sub(r'[/]', '', name)
+        return re.sub(r"[/]", "", name)
 
 
 def create_app_folder(root_folder, app_name, appid):
@@ -128,8 +143,7 @@ def create_app_folder(root_folder, app_name, appid):
         os.makedirs(app_folder, exist_ok=True)
         return app_folder
     except Exception:
-        print(f'Could not create a folder with the app name "{app_name}".\n'
-              f'Using appid ({appid}).')
+        print(f'Could not create a folder with the app name "{app_name}".\nUsing appid ({appid}).')
         app_folder = os.path.join(root_folder, appid)
         os.makedirs(app_folder, exist_ok=True)
         return appid
@@ -139,8 +153,10 @@ def backup(steam_user_folder, output_folder=None):
     # check that screenshots folder exists
     screenshots_folder = os.path.join(steam_user_folder, "760", "remote")
     if not os.path.exists(screenshots_folder):
-        print(f"Could not find the screenshots folder at {screenshots_folder}.\n"
-              f"Make sure the steam user folder is correct.")
+        print(
+            f"Could not find the screenshots folder at {screenshots_folder}.\n"
+            f"Make sure the steam user folder is correct."
+        )
         sys.exit(1)
 
     # set default output folder if not specified
@@ -271,10 +287,10 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit()
     # get args from docopt and pass to main appropriately
-    args = docopt(__doc__, version="SSU 0.1")
-    if args['backup']:
-        backup(args['<steam_user_folder>'], args['<output_folder>'])
-    elif args['sort']:
-        sort(args['<screenshots_folder>'])
-    elif args['merge']:
-        merge(args['<compressed_screenshots>'], args['<uncompressed_screenshots>'])
+    args = docopt(__doc__, version="SSU 0.2")
+    if args["backup"]:
+        backup(args["<steam_user_folder>"], args["<output_folder>"])
+    elif args["sort"]:
+        sort(args["<screenshots_folder>"])
+    elif args["merge"]:
+        merge(args["<compressed_screenshots>"], args["<uncompressed_screenshots>"])
