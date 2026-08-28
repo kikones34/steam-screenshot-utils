@@ -69,7 +69,7 @@ class AppidConverter:
         Saves the appid -> name map to local cache.
         """
         with open(self.cache_file, "w") as f:
-            json.dump(self.appid_names, f)
+            json.dump(self.appid_names, f, indent=4)
 
     def _fetch_app_name(self, appid: str):
         """
