@@ -86,7 +86,7 @@ class AppidConverter:
             r = requests.get(url)
         r.raise_for_status()
 
-        app_data = r.json()[appid]
+        app_data = next(iter(r.json().values()))
         if not app_data["success"]:
             return None
         return app_data["data"]["name"]
